@@ -1,0 +1,50 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    ports:
+      - "4000:4000"
+    env_file:
+      - .env
+    environment:
+      # Backend should call Coral over internal docker network
+      CORAL_BASE_URL: "http://coral:8080"
+    depends_on:
+      - postgres
+      - redis
+      - coral
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: sprint_intell
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  coral:
+    image: ghcr.io/withcoral/coral:latest
+    container_name: coral
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Set these based on your Coral auth/source setup
+      CORAL_API_KEY: ${CORAL_API_KEY}
+    volumes:
+      - coral-data:/var/lib/coral
+    # Adjust command flags to Coral docs/version if needed
+    command: ["serve", "--host", "0.0.0.0", "--port", "8080"]
+
+volumes:
+  pg-data:
+  coral-data:
