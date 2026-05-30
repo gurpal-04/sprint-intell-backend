@@ -39,6 +39,10 @@ COPY --from=deps /app/node_modules ./node_modules
 # Copy application source
 COPY package.json ./
 COPY src ./src
+COPY start.sh ./
+
+# Set permissions for the start script
+RUN chmod +x /app/start.sh
 
 # Switch to non-root user
 USER appuser
@@ -51,4 +55,4 @@ EXPOSE 5001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD curl -f http://localhost:5001/ || exit 1
 
-CMD ["node", "src/server.js"]
+CMD ["/app/start.sh"]
