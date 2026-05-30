@@ -1,4 +1,6 @@
 const groqService = require("./groq.service");
+// Force enable Groq service regardless of env configuration
+groqService.enabled = true;
 const coralSqlService = require("./coralSql.service");
 
 class GeminiService {
@@ -169,24 +171,22 @@ INSTRUCTIONS:
 5. Call out specific issue IDs (e.g., TES-10), PR numbers, and usernames with citations.
 6. Provide actionable next steps at the end.`;
 
-    // 1. Try Groq (Llama-3) first if enabled (implements native tool calling)
-    if (groqService.enabled) {
-      try {
-        const groqResult = await groqService.generateResponse(
-          systemPrompt,
-          query,
-          null, // Strictly live connection
-          this.executeTool.bind(this)
-        );
-        if (groqResult) {
-          return groqResult;
-        }
-      } catch (err) {
-        console.warn("Groq execution failed, trying Gemini:", err.message);
+    // 1. Try Groq (Llama-3) first (forced enabled)
+    try {
+      const groqResult = await groqService.generateResponse(
+        systemPrompt,
+        query,
+        null, // Strictly live connection
+        this.executeTool.bind(this)
+      );
+      if (groqResult) {
+        return groqResult;
       }
+    } catch (err) {
+      console.warn("Groq execution failed, attempting Gemini fallback:", err.message);
     }
 
-    // 2. Try Google Gemini API with Native Function Calling
+    // 2. Try Google Gemini API with Native Function Calling (if initialized)
     if (this.initialized && this.ai) {
       try {
         const geminiTools = [
@@ -243,7 +243,7 @@ INSTRUCTIONS:
         ];
 
         const model = this.ai.getGenerativeModel({
-          model: "gemini-1.5-flash",
+          model: "gemini-1.5-flash-latest",
           tools: geminiTools
         });
 
@@ -315,7 +315,12 @@ INSTRUCTIONS:
       }
     }
 
-    throw new Error("No live AI Service (Gemini or Groq) is initialized. Ensure your API keys are configured correctly.");
+    // If neither Groq nor Gemini is properly configured, return a helpful message instead of throwing.
+    return {
+      answer: "AI services are not configured. Please set GEMINI_API_KEY or GROQ_API_KEY in the environment.",
+      retrievedDocs: [],
+      mode: "No AI Service Configured"
+    };
   }
 }
 
