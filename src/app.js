@@ -10,8 +10,22 @@ const aiController = require("./controllers/ai.controller");
 
 const app = express();
 
+const allowedOrigins = [
+  "https://sprint-intell.netlify.app"
+];
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  }
+};
+
 // Middleware
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json());
 
 // Logging Middleware
@@ -50,6 +64,20 @@ app.post("/api/coral/sql", async (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
+
+// Slack Workspace Users Endpoint
+app.get("/api/slack/users", async (req, res) => {
+  try {
+    const result = await coralSqlService.executeSql(
+      "SELECT id, name, real_name, display_name, email FROM slack.users", 
+      null
+    );
+    res.json(result.rows || []);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 
 // Base Route
