@@ -317,9 +317,9 @@ INSTRUCTIONS:
 
     // If neither Groq nor Gemini is properly configured, return a helpful message instead of throwing.
     return {
-      answer: "AI services are not configured. Please set GEMINI_API_KEY or GROQ_API_KEY in the environment.",
+      answer: "Someething went wrong, try again later.",
       retrievedDocs: [],
-      mode: "No AI Service Configured"
+      mode: "Error"
     };
   }
 }
