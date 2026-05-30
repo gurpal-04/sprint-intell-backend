@@ -1,6 +1,4 @@
-const coralService = require("../services/coral.service");
 const geminiService = require("../services/gemini.service");
-const sprintController = require("./sprint.controller");
 
 class AIController {
   /**
@@ -19,11 +17,10 @@ class AIController {
         description: "Querying actual workspace data via the Coral CLI integrations. No mock data or scenario is active."
       };
 
-      // 1. Perform simulated Coral Semantic Retrieval
-      const retrievedDocs = await coralService.retrieveContext(query, null);
+      console.log(`[AI Controller] Routing query to Gemini/Groq Agent in Strict Live Mode`);
 
-      // 2. Feed retrieved documents and query into Gemini AI Orchestration Layer
-      const result = await geminiService.generateResponse(query, retrievedDocs, scenarioMeta);
+      // Strictly pass null for activeData to enforce live Coral CLI executions
+      const result = await geminiService.generateResponse(query, null, scenarioMeta);
 
       res.json(result);
     } catch (err) {
@@ -44,9 +41,10 @@ class AIController {
       };
 
       const standupQuery = "Generate a daily standup progress and blocker summary for the entire team based on tasks and git PR progress.";
-      const retrievedDocs = await coralService.retrieveContext(standupQuery, null);
-      
-      const result = await geminiService.generateResponse(standupQuery, retrievedDocs, scenarioMeta);
+      console.log(`[AI Controller] Generating live standup update`);
+
+      // Strictly pass null for activeData to enforce live Coral CLI executions
+      const result = await geminiService.generateResponse(standupQuery, null, scenarioMeta);
       res.json(result);
     } catch (err) {
       console.error("AI Controller Standup Error:", err);

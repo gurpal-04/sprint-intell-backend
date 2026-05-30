@@ -1,4 +1,5 @@
 const groqService = require("./groq.service");
+const coralSqlService = require("./coralSql.service");
 
 class GeminiService {
   constructor() {
@@ -15,278 +16,306 @@ class GeminiService {
           this.initialized = true;
         }
       } catch (err) {
-        console.error("Failed to initialize Google Gemini SDK, falling back to mock mode:", err.message);
+        console.error("Failed to initialize Google Gemini SDK:", err.message);
       }
     }
   }
 
   /**
-   * Orchestrates the AI reasoning pipeline using Groq (Llama-3) or Gemini, falling back to mock database rows.
-   * @param {string} query User query.
-   * @param {Array} retrievedDocs Context documents fetched via Coral.
-   * @param {Object} scenarioMeta Active scenario description and details.
-   * @returns {Promise<Object>} Response containing generated message and active context citations.
+   * Helper function to execute local database/workspace queries for tools.
+   * Strictly queries the live Coral SQL CLI by passing `null` as activeData context.
    */
-  async generateResponse(query, retrievedDocs, scenarioMeta) {
-    const contextText = retrievedDocs
-      .map((doc, idx) => `[Document ${idx + 1}] Source: ${doc.source} (${doc.id})\nTitle: ${doc.title}\nContent: ${doc.content}\n---\n`)
-      .join("\n");
+  async executeTool(name, args) {
+    try {
+      if (name === "queryLinearIssues") {
+        console.log(`[Tool Executor] Fetching Linear issues strictly from live CLI...`);
+        const result = await coralSqlService.executeSql(
+          "SELECT identifier, title, description, state_name, assignee_name, estimate, updated_at FROM linear.issues",
+          null
+        );
+        let rows = result.rows || [];
 
+        // Apply filters in JS for 100% precision
+        if (args.state) {
+          rows = rows.filter(r => String(r.state_name).toLowerCase() === args.state.toLowerCase());
+        }
+        if (args.assignee) {
+          const queryAssignee = args.assignee.toLowerCase().replace("@", "");
+          rows = rows.filter(r => {
+            const assigneeLower = String(r.assignee_name || "").toLowerCase();
+            return assigneeLower.includes(queryAssignee);
+          });
+        }
+        if (args.query) {
+          const qLower = args.query.toLowerCase();
+          rows = rows.filter(r => 
+            String(r.title || "").toLowerCase().includes(qLower) || 
+            String(r.description || "").toLowerCase().includes(qLower) ||
+            String(r.identifier || "").toLowerCase().includes(qLower)
+          );
+        }
+        return { source: "Linear", rows };
+
+      } else if (name === "queryGitHubPRs") {
+        console.log(`[Tool Executor] Fetching GitHub PRs strictly from live CLI...`);
+        const owner = process.env.GITHUB_OWNER || "gurpal-04";
+        const repo = process.env.GITHUB_REPO || "coral-demo";
+        const result = await coralSqlService.executeSql(
+          `SELECT number, title, repo, state, user__login, requested_reviewer_logins, updated_at FROM github.pulls WHERE owner = '${owner}' AND repo = '${repo}'`,
+          null
+        );
+        let rows = result.rows || [];
+
+        // Apply filters in JS for 100% precision
+        if (args.state) {
+          rows = rows.filter(r => String(r.state).toLowerCase() === args.state.toLowerCase());
+        }
+        if (args.author) {
+          const queryAuthor = args.author.toLowerCase().replace("@", "");
+          rows = rows.filter(r => String(r.user__login || "").toLowerCase().includes(queryAuthor));
+        }
+        if (args.query) {
+          const qLower = args.query.toLowerCase();
+          rows = rows.filter(r => 
+            String(r.title || "").toLowerCase().includes(qLower) || 
+            String(r.number || "").toLowerCase().includes(qLower)
+          );
+        }
+        return { source: "GitHub", rows };
+
+      } else if (name === "querySlackWorkspace") {
+        console.log(`[Tool Executor] Fetching Slack workspace metadata strictly from live CLI...`);
+        if (args.queryType === "users") {
+          const result = await coralSqlService.executeSql("SELECT name, real_name, display_name, email FROM slack.users", null);
+          return { source: "Slack Users", rows: result.rows || [] };
+        } else {
+          const result = await coralSqlService.executeSql("SELECT name, topic, purpose, num_members FROM slack.channels", null);
+          return { source: "Slack Channels", rows: result.rows || [] };
+        }
+
+      } else if (name === "querySlackMessages") {
+        console.log(`[Tool Executor] Querying Slack messages strictly from live CLI...`);
+        let channelId = args.channel;
+        if (!channelId) {
+          return { error: "A channel name or ID must be specified to query Slack messages." };
+        }
+
+        // Resolve channel name to ID if it doesn't look like a standard Slack ID (starts with C/G/D)
+        if (!channelId.startsWith("C") && !channelId.startsWith("G") && !channelId.startsWith("D")) {
+          console.log(`[Tool Executor] Resolving Slack channel name "${channelId}" to ID...`);
+          const channelResult = await coralSqlService.executeSql(
+            `SELECT id FROM slack.channels WHERE name = '${channelId}'`, 
+            null
+          );
+          if (channelResult.rows && channelResult.rows.length > 0) {
+            channelId = channelResult.rows[0].id;
+            console.log(`[Tool Executor] Resolved to channel ID "${channelId}"`);
+          } else {
+            return { error: `Slack channel with name "${channelId}" not found.` };
+          }
+        }
+
+        // Query the messages table function, joining slack.users to resolve names
+        let queryStr = `
+          SELECT 
+            COALESCE(u.real_name, u.display_name, m.user_id) AS user_name, 
+            m.text, 
+            m.ts, 
+            m.subtype 
+          FROM slack.messages(channel => '${channelId}') m
+          LEFT JOIN slack.users u ON m.user_id = u.id
+        `;
+        if (args.query) {
+          const qVal = args.query.replace(/'/g, "''");
+          queryStr += ` WHERE LOWER(m.text) LIKE '%${qVal.toLowerCase()}%'`;
+        }
+        queryStr += " ORDER BY m.ts DESC LIMIT 50";
+
+        const result = await coralSqlService.executeSql(queryStr, null);
+        return { source: "Slack Messages", rows: result.rows || [] };
+      }
+
+      return { error: `Tool ${name} is not implemented.` };
+    } catch (err) {
+      console.error(`[Tool Executor] Error executing tool ${name}:`, err.message);
+      return { error: err.message };
+    }
+  }
+
+  /**
+   * Orchestrates the AI reasoning pipeline using Groq (Llama-3) or Gemini with tool calling.
+   * Strictly reasons over live database queries without mock fallbacks.
+   * @param {string} query User query.
+   * @param {Object} activeData Unused (Strictly live connection).
+   * @param {Object} scenarioMeta Scenario metadata.
+   * @returns {Promise<Object>} Response containing generated message and active citations.
+   */
+  async generateResponse(query, activeData, scenarioMeta) {
     const systemPrompt = `You are the "Sprint Intelligence Agent", an advanced AI Engineering Operations Partner.
 Your goal is to help engineering managers analyze sprint risks, unblock teams, analyze human bottlenecks, and correlate multi-system logs across Linear, GitHub, and Slack.
 
-You have access to a simulated Coral Retrieval Layer which has pulled the following documents relevant to the user's query.
-Active Scenario: "${scenarioMeta.name}" (Description: ${scenarioMeta.description})
+You have access to native tools to query each workspace integration:
+1. queryLinearIssues: Query tickets, estimates, statuses, and assignees.
+2. queryGitHubPRs: Query active PRs, authors, reviewer allocations, and timestamps.
+3. querySlackMessages: Search developer discussion logs, alerts, and notice updates.
 
-RETIREVED MULTI-SYSTEM CONTEXT DOCUMENTS:
-${contextText || "No context documents retrieved for this query."}
+Active Mode: Strictly querying actual live workspace records via the Coral CLI integrations. No mock data fallbacks.
 
 INSTRUCTIONS:
-1. Base your answers strictly on the retrieved documents and scenario details.
-2. Provide a highly professional, engineering-manager-level summary.
-3. Structure your response with markdown, using bullet points, bold text, and code blocks for tables or alerts where appropriate.
-4. Call out specific issues (e.g. LIN-104), PRs (e.g. PR-202), and Slack messages with citations.
-5. Provide actionable next steps or suggested commands at the end.
-6. If the data indicates a sickness, incident, or severe bottleneck, highlight it in a markdown warning block.`;
+1. When you need information to answer a user's query, call the appropriate tools. You can make multiple calls or call them sequentially.
+2. Base your final answers strictly on the facts returned by the tools.
+3. If a tool returns a schema error or missing table error (e.g. for Slack messages table not found), explain clearly that message-level archiving is not enabled in the current live Slack source.
+4. Structure your response with clean markdown, using bold titles, bullet points, and warning blocks if there are critical incident regressions or bottleneck blocks.
+5. Call out specific issue IDs (e.g., TES-10), PR numbers, and usernames with citations.
+6. Provide actionable next steps at the end.`;
 
-    // 1. Try Groq (Llama-3) first if enabled
+    // 1. Try Groq (Llama-3) first if enabled (implements native tool calling)
     if (groqService.enabled) {
       try {
-        const groqAnswer = await groqService.generateResponse(systemPrompt, query);
-        if (groqAnswer) {
-          return {
-            answer: groqAnswer,
-            retrievedDocs,
-            mode: "Groq Llama-3 Mode"
-          };
+        const groqResult = await groqService.generateResponse(
+          systemPrompt,
+          query,
+          null, // Strictly live connection
+          this.executeTool.bind(this)
+        );
+        if (groqResult) {
+          return groqResult;
         }
       } catch (err) {
         console.warn("Groq execution failed, trying Gemini:", err.message);
       }
     }
 
-    // 2. Try Google Gemini API
+    // 2. Try Google Gemini API with Native Function Calling
     if (this.initialized && this.ai) {
       try {
-        const model = this.ai.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const result = await model.generateContent({
-          contents: [
-            { role: "user", parts: [{ text: `${systemPrompt}\n\nUser Question: ${query}` }] }
+        const geminiTools = [
+          {
+            functionDeclarations: [
+              {
+                name: "queryLinearIssues",
+                description: "Queries Linear issues and tasks to find identifiers, statuses, estimates, titles, descriptions, and assignees.",
+                parameters: {
+                  type: "OBJECT",
+                  properties: {
+                    assignee: { type: "STRING", nullable: true, description: "Filter by assignee display name or username (e.g. 'Gurpal Singh', 'Rohit')." },
+                    state: { type: "STRING", nullable: true, description: "Filter by issue state/status (e.g., 'In Progress', 'Blocked', 'Done', 'Todo')." },
+                    query: { type: "STRING", nullable: true, description: "Keyword or search term in task title or description." }
+                  }
+                }
+              },
+              {
+                name: "queryGitHubPRs",
+                description: "Queries active GitHub Pull Requests, including repository names, states, authors, requested reviewers, and update timestamps.",
+                parameters: {
+                  type: "OBJECT",
+                  properties: {
+                    author: { type: "STRING", nullable: true, description: "Filter by PR author username." },
+                    state: { type: "STRING", nullable: true, description: "Filter by PR state ('open', 'closed', 'Merged')." },
+                    query: { type: "STRING", nullable: true, description: "Keyword or search term in PR title." }
+                  }
+                }
+              },
+              {
+                name: "querySlackWorkspace",
+                description: "Queries Slack workspace metadata to list active channels and workspace members.",
+                parameters: {
+                  type: "OBJECT",
+                  properties: {
+                    queryType: { type: "STRING", nullable: true, description: "The type of query: 'channels' to list active channels and topics, or 'users' to list workspace members." }
+                  }
+                }
+              },
+              {
+                name: "querySlackMessages",
+                description: "Queries Slack messages from a specific channel with optional keyword search.",
+                parameters: {
+                  type: "OBJECT",
+                  properties: {
+                    channel: { type: "STRING", description: "The name or ID of the Slack channel to query (e.g. 'sprint-1-dev', 'C0B6KK2B7RU'). Required." },
+                    query: { type: "STRING", nullable: true, description: "Optional keyword to filter messages by text." }
+                  },
+                  required: ["channel"]
+                }
+              }
+            ]
+          }
+        ];
+
+        const model = this.ai.getGenerativeModel({
+          model: "gemini-1.5-flash",
+          tools: geminiTools
+        });
+
+        // Start chat with system prompt context
+        const chat = model.startChat({
+          history: [
+            {
+              role: "user",
+              parts: [{ text: systemPrompt }]
+            },
+            {
+              role: "model",
+              parts: [{ text: "Understood. I am online as the Sprint Intelligence Agent. I will use the available tools to query Linear, GitHub, and Slack logs dynamically as needed to answer your questions. Please ask your first question." }]
+            }
           ]
         });
-        const responseText = result.response.text();
+
+        console.log(`[Gemini AI] Starting live tool-calling session for query: "${query}"`);
+        let response = await chat.sendMessage(query);
+        let functionCalls = response.functionCalls();
+        let loopCount = 0;
+        const maxLoops = 5;
+        const executedTools = [];
+
+        while (functionCalls && functionCalls.length > 0 && loopCount < maxLoops) {
+          loopCount++;
+          console.log(`[Gemini AI] Agent requested ${functionCalls.length} tool calls (Turn ${loopCount}):`);
+          
+          const parts = [];
+          for (const call of functionCalls) {
+            const { name, args } = call;
+            console.log(`   -> Calling Tool: ${name} with args:`, args);
+
+            const toolResult = await this.executeTool(name, args);
+            
+            // Format for prompt response
+            parts.push({
+              functionResponse: {
+                name: name,
+                response: toolResult
+              }
+            });
+
+            // Map for citation display in the frontend
+            executedTools.push({
+              source: toolResult.source || "System",
+              id: args.query || args.assignee || args.channel || "All",
+              title: `Query: ${args.query || "Filter"}`,
+              content: toolResult.error 
+                ? `Tool error: ${toolResult.error}`
+                : `Retrieved ${toolResult.rows?.length || 0} items matching filters: ${JSON.stringify(args)}`
+            });
+          }
+
+          response = await chat.sendMessage(parts);
+          functionCalls = response.functionCalls();
+        }
+
+        const finalAnswer = response.text();
         return {
-          answer: responseText,
-          retrievedDocs,
-          mode: "Gemini AI Mode"
+          answer: finalAnswer,
+          retrievedDocs: executedTools,
+          mode: `Gemini AI Live Tool Calling Mode (${loopCount} turns)`
         };
+
       } catch (err) {
-        console.error("Gemini API call failed, using mock generator:", err);
+        console.error("Gemini API call failed:", err);
+        throw err;
       }
     }
 
-    // 3. Mock data reasoning disabled
-    return {
-      answer: `### ❌ AI Reasoning Offline (API Key Missing)
-
-To test live conversational reasoning over actual workspace records, please configure your **GEMINI_API_KEY** or **GROQ_API_KEY** in the [backend/.env](file:///Users/panda/Projects/coral-test/backend/.env) file. 
-
-*Mock reasoning and database scenario fallbacks are currently disabled.*`,
-      retrievedDocs,
-      mode: "Offline Mode (Keys Not Configured)"
-    };
-  }
-
-  generateMockResponse(query, retrievedDocs, scenarioMeta) {
-    const q = query.toLowerCase();
-    const sid = scenarioMeta.id;
-
-    if (q.includes("pr") || q.includes("pull") || q.includes("issue") || q.includes("task") || q.includes("ticket")) {
-      const githubPRs = retrievedDocs.filter(doc => doc.source.toLowerCase() === "github");
-      const linearIssues = retrievedDocs.filter(doc => doc.source.toLowerCase() === "linear");
-
-      let response = `### 🤖 Live Workspace Items (Sandbox Mode)\n\n`;
-      response += `I queried the local **Coral Retrieval Layer** for you. Here are the live items matching your request:\n\n`;
-
-      if (githubPRs.length > 0) {
-        response += `#### 📂 GitHub Pull Requests\n`;
-        githubPRs.forEach(pr => {
-          response += `* **[${pr.id}] ${pr.title.replace("Pull Request: ", "")}**\n  - *Context*: ${pr.content}\n`;
-        });
-        response += `\n`;
-      }
-
-      if (linearIssues.length > 0) {
-        response += `#### 📋 Linear Issues & Tasks\n`;
-        linearIssues.forEach(task => {
-          const title = task.title.replace("Task: ", "");
-          response += `* **[${task.id || "Linear Task"}] ${title || "Task"}**\n  - *Context*: ${task.content}\n`;
-        });
-        response += `\n`;
-      }
-
-      if (githubPRs.length === 0 && linearIssues.length === 0) {
-        response += `*No matching live open pull requests or active issues were found in the current context.*`;
-      } else {
-        response += `> [!NOTE]\n`;
-        response += `> These details were successfully queried live from your local workspace integrations via the **Coral CLI**!`;
-      }
-
-      return response;
-    }
-
-    if (q.includes("delay") || q.includes("blocked") || q.includes("why is")) {
-      if (sid === 1) {
-        return `### ⚠️ Sprint 24 Delay Analysis
-
-Our Coral retrieval engine has correlated logs across **Linear**, **GitHub**, and **Slack** to identify the primary critical path blockages delaying the sprint:
-
-#### 1. Stuck Dependency Blockage
-* **Blocked Issue**: [LIN-108] **Create User Profile Settings & Integration Connectors** assigned to **Leo Russo** (3 pts).
-* **Root Cause Blocker**: Leo is blocked on merging his task until the core Gemini API ingestion endpoint is completed. This backend work is managed in Linear issue [LIN-102] and implemented in open **GitHub Pull Request [PR-202]** (*"feat(gemini): connect chat orchestrator endpoint"*).
-* **Review Pipeline Stuck**: **PR-202** has been open for **27 hours** with no activity. The designated DevOps reviewer, **Chloe Diaz**, is currently flagged as **Out Sick** in Slack logs with a high fever.
-
-#### 2. Resource Constraints
-* **Marcus Vance** (Senior Backend Engineer) is currently **98% overloaded** with database indexing work in [LIN-101] (PR-201) and does not have the capacity to step in and review Chloe's pipeline changes.
-
----
-
-### 📋 Suggested Action Items
-> [!IMPORTANT]
-> **Recommended Actions to Unblock Sprint 24:**
-> 1. **Reassign PR-202 Reviewer**: Reassign **PR-202** review duty from Chloe Diaz to **Sophia Chen** (Tech Lead) immediately to bypass the pipeline block.
-> 2. **Establish Staging Deployment Override**: Have Sophia override Chloe's sick status in GitHub actions to trigger the staging deploy manually once PR-202 gets the green light.
-> 3. **Reschedule Task LIN-108**: Advise Leo Russo to temporarily pause settings UI work and assist Sophia with PR audits to reduce Marcus's backlog.`;
-      }
-
-      if (sid === 2) {
-        return `### 🚨 Post-Deployment Incident Delay
-The sprint pipeline is halted because of a critical staging incident reported in Slack:
-
-* **Trigger Incident**: Deployment alert **TypeError: Cannot read properties of undefined (reading 'avatar')** at \`App.jsx:42\`.
-* **Correlated Event**: Merged **PR-203** by **Leo Russo** (*"ui(dashboard): dark-mode glassmorphic layouts & custom scrollbars"*) which went live in staging 15 minutes before the crash spike.
-* **Incident Impact**: Staging builds are currently unusable, halting Emma's automated test suites (LIN-105).
-
----
-
-### 📋 Suggested Action Items
-> [!CAUTION]
-> **Active Emergency Protocol:**
-> 1. **Deploy Staging Rollback**: Initiate a pipeline rollback to the previous stable staging container (Commit: \`9e24a10\`).
-> 2. **Optional Chaining Hotfix**: Leo Russo must push an immediate patch replacing line 42 with optional chaining (\`user?.profile?.avatar\`) to resolve null profiles crash.
-> 3. **Unblock QA**: Emma Watson's E2E checks (LIN-105) must hold execution until staging rollback compiles successfully.`;
-      }
-
-      return `### ⚠️ General Sprint Bottlenecks
-We have retrieved several blocks:
-- **Marcus Vance** is marked as a critical bottleneck (workload score **95%**), assigned to multiple urgent tasks.
-- **PR-201** and **PR-202** are open awaiting review, stalling backend integrations.
-- **LIN-104** (Timeline Widget) shows stagnant progress with no git pushes in the last 3 days.`;
-    }
-
-    if (q.includes("overloaded") || q.includes("bottleneck") || q.includes("who is")) {
-      return `### 📊 Human Bottlenecks & Team Workload Analysis
-
-Based on cross-tool capacity data, we have flagged **Marcus Vance** as a severe bottleneck for Sprint 24:
-
-| Engineer | Active Tasks | Pending Reviews | Workload Score | Status |
-| :--- | :---: | :---: | :---: | :--- |
-| **Marcus Vance** | 4 | 6 | **98%** | 🔴 **Critical Bottleneck** |
-| **Sophia Chen** | 2 | 1 | **40%** | 🟢 Healthy |
-| **Leo Russo** | 2 | 0 | **60%** | 🟢 Healthy |
-| **Emma Watson** | 2 | 1 | **50%** | 🟢 Healthy |
-| **Chloe Diaz** | 1 | 1 | **30%** | 🟢 Healthy (Scenario dependent) |
-
-#### Bottleneck Details:
-1. **Review Queue Depth**: Marcus has **6 pending reviews** assigned in GitHub, resulting in stale rates (>24h) for other engineers' PRs.
-2. **Heavy Active Tasks**: Marcus is simultaneously tackling [LIN-101] (Coral Retrieval Service - 8 pts) and [LIN-102] (Gemini Integration - 5 pts).
-
----
-
-### 📋 Recommended Load Balancing
-* **Reassign Code Reviews**: Sophia should reassign **PR-205** and **PR-206** reviews away from Marcus.
-* **Redistribute Scope**: Delegate automated index audits (LIN-107) to help offload backend context logic.`;
-    }
-
-    if (q.includes("incident") || q.includes("error") || q.includes("crash")) {
-      return `### 🔍 Incident Correlation Report
-
-Coral correlated Slack discussion and GitHub Git history:
-
-* **Staging Crash Name**: \`TypeError: Cannot read properties of undefined (reading 'avatar')\` at \`App.jsx:42\`.
-* **Incident Reports**: Multiple user sessions affected on staging within minutes of deploy.
-* **Correlated Commit**: GitHub merge **PR-203** (*"ui(dashboard): dark-mode glassmorphic layouts & custom scrollbars"*) by **Leo Russo**.
-* **Slack Discussion**: Staging incident alerts in \`#ops-alerts\` led to a triage discussion in \`#sprint-24-dev\` involving Chloe, Leo, and Sophia.
-
----
-
-### 🛠️ Root Cause & Fix
-The avatar layout assumes a nested profile structure (\`user.profile.avatar\`) without validating if \`profile\` is populated. In the staging DB, new test users do not have a profile, leading to the crash.
-**Fix suggestion**:
-\`\`\`javascript
-// In App.jsx line 42:
-- <img src={user.profile.avatar} />
-+ <img src={user?.profile?.avatar || DEFAULT_AVATAR_URL} />
-\`\`\``;
-    }
-
-    if (q.includes("silent") || q.includes("no activity") || q.includes("stale") || q.includes("3 days")) {
-      return `### 🕵️ Silent Blocker Detection Alert
-
-The agent has automatically flagged a **Critical Silent Blocker** in Sprint 24:
-
-* **Issue**: [LIN-104] **Build Event Correlation Timeline Widget** (5 pts)
-* **Assignee**: **Leo Russo**
-* **Flag Status**: 🔴 **Critical Stagnancy**
-* **Correlation Evidence**:
-  - **Linear**: Marked *"In Progress"* for **5 consecutive days**. Last activity dated **May 19**.
-  - **GitHub**: **Zero git commits** pushed on branches relating to timeline widgets. **No Draft PR** created.
-  - **Slack**: Sophia pinged Leo in \`#sprint-24-dev\` on **May 23** and **May 24** asking for status updates, with **zero replies**.
-  - **Other Channels**: Leo Russo has been highly active in the **#gaming-zone** channel, posting about unlocking Valorant skins at **14:00 today**.
-
----
-
-### 💡 Recommendation
-Leo is likely stuck on the timeline visualization layout (or distracted). The Tech Lead (**Sophia**) should schedule a 15-minute pairing session with Leo to align on Recharts/Framer-motion visual layouts and unblock the ticket.`;
-    }
-
-    if (q.includes("standup") || q.includes("summary")) {
-      return `### 📝 Sprint 24 Standup Summary Generator
-
-Generated from raw task logs and git commits for **May 24**:
-
-#### 👩‍💻 Sophia Chen (Tech Lead)
-* **Yesterday (Done)**: Audited database composite constraints and index rules.
-* **Today (Plan)**: Assist with Gemini Express controller integrations; review Marcus's vector indexing PR-201.
-* **Blockers**: None.
-
-#### 👨‍💻 Marcus Vance (Senior Backend Engineer)
-* **Yesterday (Done)**: Finished testing vector search indexing configurations; initialized Gemini router controllers (PR-202).
-* **Today (Plan)**: Fix multi-tenant lookups; resolve open PR reviews.
-* **Blockers**: Massive review backlog (6 pending PRs).
-
-#### 👦 Leo Russo (Frontend Engineer)
-* **Yesterday (Done)**: Initialized settings integration panel templates.
-* **Today (Plan)**: Complete Framer-motion interactive components for the Timeline view.
-* **Blockers**: Stuck on timeline SVG correlation nodes (Flagged as silent blocker).`;
-    }
-
-    return `### 🤖 Sprint Intelligence Assistant
-
-I am connected to the **Coral Retrieval Layer** simulating access to **Linear**, **GitHub**, and **Slack**.
-
-Here is a summary of the active sprint:
-* **Sprint**: Sprint 24
-* **Health Score**: ${scenarioMeta.id === 1 ? "68%" : scenarioMeta.id === 2 ? "45%" : scenarioMeta.id === 3 ? "58%" : "82%"}
-* **Active Scenario**: ${scenarioMeta.name}
-* **Retrieved context chunks**: Checked ${retrievedDocs.length} documents.
-
-How can I help you troubleshoot? You can ask:
-1. *"Why is the sprint delayed?"*
-2. *"Who is overloaded with reviews?"*
-3. *"Are there any active production bugs?"*
-4. *"Detect silent blockers."*
-5. *"Generate a standup summary for the team."*`;
+    throw new Error("No live AI Service (Gemini or Groq) is initialized. Ensure your API keys are configured correctly.");
   }
 }
 
