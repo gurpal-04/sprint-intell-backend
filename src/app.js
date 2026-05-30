@@ -11,7 +11,8 @@ const aiController = require("./controllers/ai.controller");
 const app = express();
 
 const allowedOrigins = [
-  "https://sprint-intell.netlify.app"
+  "https://sprint-intell.netlify.app",
+  "http://localhost:5173",
 ];
 
 const corsOptions = {
@@ -36,6 +37,7 @@ app.use((req, res, next) => {
 
 // REST API Routes
 // Sprint Operations
+app.get("/api/sprint/bootstrap", sprintController.getBootstrap);
 app.get("/api/sprint/overview", sprintController.getOverview);
 app.get("/api/sprint/issues", sprintController.getIssues);
 app.get("/api/sprint/pull-requests", sprintController.getPullRequests);

@@ -5,6 +5,12 @@ const { exec } = require("child_process");
  * or falls back gracefully to a high-fidelity mock scenario database.
  */
 class CoralSqlService {
+  constructor() {
+    this.queue = Promise.resolve();
+    this.cache = new Map(); // sqlQuery -> { result, timestamp }
+    this.CACHE_TTL = 5000; // 5 seconds in ms
+  }
+
   /**
    * Executes a SQL query. If Coral CLI is installed locally on the host machine,
    * it triggers the live cli command: `coral sql "<QUERY>"`.
@@ -14,6 +20,44 @@ class CoralSqlService {
    * @returns {Promise<Object>} { columns: string[], rows: Object[] }
    */
   async executeSql(sqlQuery, data) {
+    const now = Date.now();
+    const cacheKey = sqlQuery.trim();
+
+    // Check cache first
+    if (this.cache.has(cacheKey)) {
+      const cached = this.cache.get(cacheKey);
+      if (now - cached.timestamp < this.CACHE_TTL) {
+        console.log(`[Coral SQL] Cache HIT for query: "${sqlQuery.substring(0, 60)}..."`);
+        return cached.result;
+      } else {
+        this.cache.delete(cacheKey);
+      }
+    }
+
+    // Queue query execution to prevent concurrent subprocess spawns
+    const result = await new Promise((resolve) => {
+      this.queue = this.queue.then(async () => {
+        try {
+          const res = await this._executeSqlDirect(sqlQuery, data);
+          resolve(res);
+        } catch (err) {
+          resolve({ error: err.message });
+        }
+      });
+    });
+
+    // Cache successful execution results
+    if (result && !result.error) {
+      this.cache.set(cacheKey, {
+        result,
+        timestamp: Date.now()
+      });
+    }
+
+    return result;
+  }
+
+  async _executeSqlDirect(sqlQuery, data) {
     return new Promise((resolve) => {
       // 1. Try to execute the query against the actual live local Coral CLI
       const escapedQuery = sqlQuery.replace(/"/g, '\\"');
