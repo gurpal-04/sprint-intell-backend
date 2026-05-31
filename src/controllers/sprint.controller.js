@@ -336,34 +336,101 @@ class SprintController {
     const owner = process.env.GITHUB_OWNER || "gurpal-04";
     const repo = process.env.GITHUB_REPO || "coral-test";
     
-    const issuesQuery = "SELECT identifier, title, state_name, updated_at, assignee_name FROM linear.issues ORDER BY updated_at DESC LIMIT 5";
+    // 1. Fetch Linear issues with both created_at and updated_at
+    const issuesQuery = "SELECT identifier, title, state_name, created_at, updated_at, assignee_name FROM linear.issues ORDER BY updated_at DESC LIMIT 15";
     const issuesResult = await coralSqlService.executeSql(issuesQuery, null);
     if (issuesResult.error) {
       throw new Error(issuesResult.error);
     }
     
-    const prsQuery = `SELECT number, title, state, updated_at, user__login FROM github.pulls WHERE owner = '${owner}' AND repo = '${repo}' ORDER BY updated_at DESC LIMIT 5`;
+    // 2. Fetch GitHub pull requests
+    const prsQuery = `SELECT number, title, state, updated_at, user__login FROM github.pulls WHERE owner = '${owner}' AND repo = '${repo}' ORDER BY updated_at DESC LIMIT 10`;
     const prsResult = await coralSqlService.executeSql(prsQuery, null);
     if (prsResult.error) {
       throw new Error(prsResult.error);
     }
+
+    // 3. Fetch Slack messages from '#sprint-1-dev' dynamically if possible
+    let slackEvents = [];
+    try {
+      // Resolve slack channel ID first
+      const channelResult = await coralSqlService.executeSql("SELECT id FROM slack.channels WHERE name = 'sprint-1-dev' LIMIT 1", null);
+      let channelId = null;
+      if (channelResult.rows && channelResult.rows.length > 0) {
+        channelId = channelResult.rows[0].id;
+      }
+
+      if (channelId) {
+        // Query Slack users to resolve display names
+        const slackUsersResult = await coralSqlService.executeSql("SELECT id, real_name, display_name, name FROM slack.users", null);
+        const slackUsers = slackUsersResult.rows || [];
+
+        // Query parameterized Slack messages function
+        const slackMsgResult = await coralSqlService.executeSql(
+          `SELECT m.user_id AS sender, m.text AS message, m.ts AS timestamp FROM slack.messages(channel => '${channelId}') m ORDER BY m.ts DESC LIMIT 2`,
+          null
+        );
+
+        if (slackMsgResult.rows) {
+          slackMsgResult.rows.forEach((row, idx) => {
+            const user = slackUsers.find(u => u.id === row.sender);
+            const senderHandle = user ? `@${user.real_name || user.display_name || user.name}` : row.sender || "@unknown";
+            
+            let parsedTime = row.timestamp;
+            if (row.timestamp && !isNaN(row.timestamp)) {
+              parsedTime = new Date(parseFloat(row.timestamp) * 1000).toISOString();
+            }
+
+            slackEvents.push({
+              id: `live_ev_slack_${idx}`,
+              timestamp: parsedTime || new Date().toISOString(),
+              source: "Slack",
+              type: "message_sent",
+              title: `Slack message from ${senderHandle}`,
+              description: `Message: "${row.message}"`,
+              engineerId: senderHandle
+            });
+          });
+        }
+      }
+    } catch (slackErr) {
+      console.warn("[Sprint Controller] Timeline failed to retrieve Slack messages:", slackErr.message);
+    }
     
     const events = [];
     
+    // Add Linear events
     if (issuesResult && issuesResult.rows) {
       issuesResult.rows.forEach((row, idx) => {
-        events.push({
-          id: `live_ev_issue_${idx}`,
-          timestamp: row.updated_at || new Date().toISOString(),
-          source: "Linear",
-          type: "task_updated",
-          title: `Issue ${row.identifier} Update`,
-          description: `Issue '${row.title}' is currently '${row.state_name}' (Assigned to ${row.assignee_name || "Unassigned"}).`,
-          engineerId: row.assignee_name || "Unassigned"
-        });
+        // A. Created Event
+        if (row.created_at) {
+          events.push({
+            id: `live_ev_issue_create_${idx}`,
+            timestamp: row.created_at,
+            source: "Linear",
+            type: "task_created",
+            title: `Issue ${row.identifier} Created`,
+            description: `New issue '${row.title}' has been added to the backlog (Assigned to ${row.assignee_name || "Unassigned"}).`,
+            engineerId: row.assignee_name || "Unassigned"
+          });
+        }
+
+        // B. Updated Event (only if updated_at is distinct from created_at)
+        if (row.updated_at && row.updated_at !== row.created_at) {
+          events.push({
+            id: `live_ev_issue_update_${idx}`,
+            timestamp: row.updated_at,
+            source: "Linear",
+            type: "task_updated",
+            title: `Issue ${row.identifier} Updated`,
+            description: `Issue '${row.title}' progress changed to '${row.state_name}' (Assigned to ${row.assignee_name || "Unassigned"}).`,
+            engineerId: row.assignee_name || "Unassigned"
+          });
+        }
       });
     }
     
+    // Add GitHub events
     if (prsResult && prsResult.rows) {
       prsResult.rows.forEach((row, idx) => {
         events.push({
@@ -377,7 +444,11 @@ class SprintController {
         });
       });
     }
+
+    // Add Slack events
+    events.push(...slackEvents);
     
+    // Sort all events chronologically (newest first)
     events.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
     return events;
   };
